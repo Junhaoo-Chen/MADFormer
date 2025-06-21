@@ -1,0 +1,382 @@
+"""
+A minimal training script for MADFormer using PyTorch DDP.
+"""
+import os
+import time
+import math
+import random
+import einops
+import datetime 
+import argparse
+import logging
+import torch
+import numpy as np
+from PIL import Image
+from copy import deepcopy
+from glob import glob
+from functools import partial
+from collections import OrderedDict
+from datasets import load_dataset
+from diffusers import AutoencoderKL, DDPMScheduler
+
+torch.backends.cuda.matmul.allow_tf32 = True # True makes A100 training a lot faster
+torch.backends.cudnn.allow_tf32 = True
+import torch.distributed as dist
+from torch.optim import lr_scheduler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+import torch.nn.functional as F
+
+from transform_utils import build_image_transform_ffhq
+from models import MADFormer
+
+#################################################################################
+#                             Training Helper Functions                         #
+#################################################################################
+
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    """
+    Step the EMA model towards the current model.
+    """
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
+        ema_params[name].mul_(decay).add_(param.data.to(torch.float32), alpha=1 - decay)
+
+
+def requires_grad(model, flag=True):
+    """
+    Set requires_grad flag for all parameters in a model.
+    """
+    for p in model.parameters():
+        p.requires_grad = flag
+
+def create_logger(logging_dir):
+    """
+    Create a logger that writes to a log file and stdout.
+    """
+    if dist.get_rank() == 0:  # real logger
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[\033[34m%(asctime)s\033[0m] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+        )
+        logger = logging.getLogger(__name__)
+    else:  # dummy logger (does nothing)
+        logger = logging.getLogger(__name__)
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+def build_image_transform_ffhq(image_size, mean, std):
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std, inplace=True)
+    ])
+    def transform_image_batch(batch):
+        images = [transform(img) for img in batch['webp']]
+        return {'data': images}
+    return transform_image_batch
+
+#################################################################################
+#                                  Training Loop                                #
+#################################################################################
+
+def main(args):
+    """
+    Trains a new MADFormer model.
+    """
+    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+
+    # Setup DDP:
+    dist.init_process_group(backend="nccl", init_method="env://")
+    assert args.global_batch_size % (args.per_gpu_batch_size * dist.get_world_size()) == 0, f"Batch size must be divisible by world size * per gpu batch size."
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    seed = args.global_seed * dist.get_world_size() + local_rank
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()} on device cuda:{local_rank}.")
+
+    if rank == 0:
+        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+        experiment_index = len(glob(f"{args.results_dir}/*"))
+        model_string_name = "MADFormer"
+        if args.id:
+            experiment_dir = f"{args.results_dir}/{args.id}-{model_string_name}"  # Create an experiment folder
+        else:
+            experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
+        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger = create_logger(experiment_dir)
+        logger.info(f"Experiment directory created at {experiment_dir}")
+    else:
+        logger = create_logger(None)
+
+    # Create model:
+    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    model = MADFormer(
+        latent_size=args.vae_latent_size*args.patch_size**2,
+        block_size=args.block_size,
+        ar_len=args.ar_len,
+        spatial_len=args.spatial_len,
+        square_block=args.square_block,
+        model_config_path=args.model_config_path,
+        diff_depth=args.diff_depth,
+        clear_clean=args.clear_clean,
+        clear_cond=args.clear_cond,
+        denoising_mlp=args.denoising_mlp
+    ).to(local_rank)
+        
+    # Note that parameter initialization is done within the DiT constructor
+    ema = deepcopy(model).to(local_rank).to(torch.float32)  # Create an EMA of the model for use after training
+    requires_grad(ema, False)
+    
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(local_rank).eval()
+    
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(args.beta1, args.beta2))
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.mixed_precision =='fp16'))
+
+    # Prepare models for training:
+    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    ema.eval()  # EMA model should always be in eval mode
+
+    scheduler = DDPMScheduler()
+    model = DDP(model, device_ids=[local_rank])
+
+    if args.dataset == 'ffhq':
+        dataset = load_dataset(args.dataset_path, split='train')
+        dataset.set_transform(build_image_transform_ffhq(args.image_size, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
+    else:
+        raise NotImplementedError
+
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=args.global_seed
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=int(args.per_gpu_batch_size),
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    accumulation_steps = args.global_batch_size // (args.per_gpu_batch_size * dist.get_world_size())
+    step_per_epoch = len(dataloader) // accumulation_steps
+    total_steps = args.epochs * step_per_epoch
+    if args.lr_scheduler == "wsd":
+        def lambda_wsd(step, stages, end_lr_exponent=6):
+            if step < stages[0]:
+                return step /stages[0]
+            elif step < stages[1]:
+                return 1.0
+            else:
+                ratio = (step - stages[1])/(stages[2] - stages[1])
+                return 0.5**(ratio*end_lr_exponent)
+        lrs = lr_scheduler.LambdaLR(opt, lr_lambda=partial(lambda_wsd, stages=[int(args.lr_warmup*total_steps), int(0.85*total_steps), total_steps], end_lr_exponent=6))
+    elif args.lr_scheduler == "cosine":
+        def lambda_cosine(step, stages, end_lr_ratio=0):
+            if step < stages[0]:
+                return step /stages[0]
+            else:
+                ratio = (step - stages[0])/(stages[1] - stages[0])
+                return end_lr_ratio + 0.5 * (1 - end_lr_ratio) * (1 + math.cos(ratio*math.pi))
+        lrs = lr_scheduler.LambdaLR(opt, lr_lambda=partial(lambda_cosine, stages=[int(args.lr_warmup*total_steps), total_steps], end_lr_ratio=0.01))
+    else:
+        lrs = None
+
+    logger.info(f"Total steps: {total_steps}")
+
+    # Variables for monitoring/logging purposes:
+    running_loss = 0
+    train_steps = 0
+    last_train_step = 0
+    start_time = time.time()
+
+    logger.info(f"Training for {args.epochs} epochs...")
+    vae_scaling_factor =  vae.config.get("scaling_factor", 0.18215)
+
+    ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
+    for epoch in range(args.epochs):
+        sampler.set_epoch(epoch)
+        logger.info(f"Beginning epoch {epoch}...")
+        accumulation_counter = 0
+        opt.zero_grad()
+        for data in dataloader:
+            x = data['data'].to(local_rank)
+
+            batch_size = x.size(0)
+            with torch.inference_mode():
+                # Map input images to latent space + normalize latents:
+                image_shape = x.shape[-3:]
+                latent = vae.encode(x.view(-1, *image_shape)).latent_dist.sample().mul_(vae_scaling_factor)
+                _, _, latent_h, latent_w = latent.size()
+                latent = einops.rearrange(latent, 'N C (h1 h2) (w1 w2) -> N (h1 w1) (h2 w2 C)', h2=args.patch_size, w2=args.patch_size)
+            latent = latent.clone() # other wise it is an inference tensor
+
+            if args.square_block:
+                assert math.isqrt(args.pre_downsample_block_size) ** 2 == args.pre_downsample_block_size
+                latent = einops.rearrange(latent, 'N (H W) C-> N H W C', H=latent_h//args.patch_size, W=latent_h//args.patch_size)
+                block_h = block_w = int(math.isqrt(args.pre_downsample_block_size))
+                latent = einops.rearrange(latent, 'N (new_h block_h) (new_w block_w) c -> N new_h new_w block_h block_w c', block_h=block_h, block_w=block_w)
+                latent = einops.rearrange(latent, '(N T) new_h new_w block_h block_w c -> N (T new_h new_w) (block_h block_w) c', T=1)
+            else:
+                latent = einops.rearrange(latent, '(N T) B C -> N T B C', N=batch_size)
+                latent = einops.rearrange(latent, 'N T B C -> N (T B) C')
+                latent = einops.rearrange(latent, 'N (T B) C-> N T B C', B=args.block_size) # For multi-frames
+            
+            N, T, B, C = latent.shape
+            noise = torch.randn_like(latent)
+            t = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size, T))
+            noised_latent = scheduler.add_noise(latent.reshape(-1, 1, B, C), noise.reshape(-1, 1, B, C), t.reshape(-1)).reshape(N, T, B, C)
+
+            opt.zero_grad()
+            with torch.amp.autocast('cuda', dtype=ptdtype):
+                noise_pred, condition, clean_tower_output = model(latent, noised_latent, t)
+                noise_pred = einops.rearrange(noise_pred, '(N T) C H W -> N T (H W) C', T=T)
+                condition = einops.rearrange(condition, '(N T) C H W -> N T (H W) C', T=T)
+                image_loss = F.mse_loss(noise_pred, noise)
+                hidden_loss = F.mse_loss(condition, latent) if not args.clear_cond else 0
+                if args.clear_clean and args.clear_tower_loss_lambda != 0 and clean_tower_output is not None:
+                    clean_tower_output = einops.rearrange(clean_tower_output, '(N T) C H W -> N T (H W) C', T=T)[:, :-1, :, :]
+                    clear_tower_loss = F.mse_loss(clean_tower_output, latent[:, :-1, :, :])
+                else:
+                    clear_tower_loss = 0
+                loss_orig = image_loss + args.lambda_hidden_loss * hidden_loss + args.clear_tower_loss_lambda * clear_tower_loss
+                loss = loss_orig / accumulation_steps
+            
+            scaler.scale(loss).backward()
+            accumulation_counter += 1
+            running_loss += loss_orig.item()
+            
+            if accumulation_counter == accumulation_steps:
+                scaler.unscale_(opt)
+                if args.max_grad_norm != 0.0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
+                else:
+                    grad_norm = 0.0
+
+                scaler.step(opt)
+                scaler.update()
+                if lrs is not None:
+                    lrs.step()
+                update_ema(ema, model.module)
+                opt.zero_grad()
+                accumulation_counter = 0
+                train_steps += 1
+
+                if train_steps % args.log_every == 0:
+                    # Measure training speed:
+                    torch.cuda.synchronize()
+                    end_time = time.time()
+                    steps_per_sec = (train_steps - last_train_step) / (end_time - start_time)
+                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # Reduce loss history over all processes:
+                    avg_loss = torch.tensor(running_loss / (train_steps * accumulation_steps), device=local_rank)
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / dist.get_world_size()
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, LR: {opt.param_groups[0]['lr']}, "
+                                f"Grad Norm: {grad_norm:.4f}, Hidden Loss: {hidden_loss:.4f}, Image Loss: {image_loss:.4f}, Clean Tower Loss: {clear_tower_loss:.4f} "
+                                f"Time: {current_time}, Train Steps/Sec: {steps_per_sec:.2f}")
+                    # Reset monitoring variables:
+                    last_train_step = train_steps
+                    running_loss = 0
+                    start_time = time.time()
+
+                if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                    if rank == 0:
+                        checkpoint = {
+                            "model": model.module.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "lrs": lrs.state_dict() if lrs is not None else {},
+                            "args": args
+                        }
+                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                        torch.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+        
+        if accumulation_counter > 0:
+            scaler.unscale_(opt)
+            if args.max_grad_norm != 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
+            else:
+                grad_norm = 0.0
+
+            scaler.step(opt)
+            scaler.update()
+            if lrs is not None:
+                lrs.step()
+            update_ema(ema, model.module)
+            opt.zero_grad()
+            train_steps += 1
+            accumulation_counter = 0
+        
+        dist.barrier()
+
+    logger.info("Done!")
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results_dir", type=str, default="results")
+    parser.add_argument("--dataset", type=str, choices=['ffhq'], default='ffhq')
+    parser.add_argument("--dataset_path", type=str, default='./Your/Dataset/Path/Here')
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=5e-2, help="Weight decay to use.")
+    parser.add_argument("--beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
+    parser.add_argument("--beta2", type=float, default=0.95, help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--global_batch_size", type=int, default=256)
+    parser.add_argument("--per_gpu_batch_size", type=int, default=2)
+    parser.add_argument("--global_seed", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--ckpt_every", type=int, default=1)
+    parser.add_argument("--mixed_precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--image_size", type=int, choices=[256, 512, 1024], default=256)
+    parser.add_argument("--patch_size", default=1, type=int, help="patch_size x patch_size of vae latents forms an input feature")
+    parser.add_argument("--vae_latent_size", default=4, type=int, help="vae's latent feature size")
+    parser.add_argument("--block_size", default=16, type=int, help="vae's latent feature size")
+    parser.add_argument("--pre_downsample_block_size", default=64, type=int, help="vae's latent feature size")
+    parser.add_argument("--vae_patch_pixels", default=8, type=int, help="sqrt of pixels in a vae token")
+    parser.add_argument("--square_block", action="store_true")
+    parser.add_argument("--ar_len", type=int, default=16)
+    parser.add_argument("--use_rope", action="store_true")
+    parser.add_argument("--lr_scheduler", type=str, default="wsd", choices=["wsd", "cosine", "constant"])
+    parser.add_argument("--lr_warmup", type=float, default=0.0)
+    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--model_config_path", type=str, default=None)
+    parser.add_argument("--spatial_len", type=int, default=1024)
+    parser.add_argument("--lambda_hidden_loss", type=float, default=0.1)
+    parser.add_argument("--diff_depth", type=int, default=14)
+    parser.add_argument("--clear_clean", action="store_true", default=False)
+    parser.add_argument("--clear_cond", action="store_true", default=False)
+    parser.add_argument("--denoising_mlp", action="store_true", default=False)
+    parser.add_argument("--clear_tower_loss_lambda", type=float, default=0.0)
+    parser.add_argument("--single_tower", action="store_true", default=False)
+    parser.add_argument("--id", type=str, default=None)
+    args = parser.parse_args()
+
+    print(args)
+    main(args)
