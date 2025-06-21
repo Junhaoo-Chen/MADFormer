@@ -8,6 +8,18 @@ This repository contains the official implementation of **MADFormer**, a unified
 
 ## Overview
 
+**MADFormer** (**M**ixed **A**utoregressive and **D**iffusion Transformer) bridges the strengths of autoregressive (AR) and diffusion-based generation through a unified architecture designed for **continuous image synthesis**. It introduces a **dual-axis hybridization strategy**, mixing AR and diffusion both across **image blocks** (token axis) and **transformer layers** (depth axis). This enables:
+
+- **Global context modeling** through autoregressive conditioning across image blocks.
+- **Local detail refinement** via diffusion modeling within each block’s continuous latent space.
+- **Flexible capacity allocation**, allowing principled trade-offs between speed and quality.
+
+> TODO: Add images for model arch
+
+The generation process of MADFormer: each image block is autoregressively predicted, then refined through a conditioned diffusion process.  
+
+MADFormer acts not only as a performant generator for high-resolution data like **FFHQ-1024** and regular images like **ImageNet-256**, but also as a **testbed** for exploring hybrid design choices. Notably, we show that **increasing AR layer allocation** can improve FID by up to **60–75%** under constrained inference budgets. Our modular design supports controlled experiments on inference cost, block granularity, loss objectives, and layer allocation—offering actionable insights for hybrid model design in multimodal generation.
+
 ## Models
 We provide the model weights for MADFormer trained on FFHQ-1024 and ImageNet through the download links below.
 
@@ -44,8 +56,10 @@ FID scores are computed using the [pytorch-fid](https://pypi.org/project/pytorch
 
 ## Acknowledgements
 This code is mainly built upon the [ACDiT](https://github.com/thunlp/ACDiT) repository.
+
 ## License
 This project is liscenced under the Apache-2.0 liscence.
+
 ## Citation
 
 If you find MADFormer useful in your research, please consider citing our paper:
