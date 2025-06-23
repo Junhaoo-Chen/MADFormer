@@ -14,8 +14,9 @@ This repository contains the official implementation of **MADFormer**, a unified
 - **Local detail refinement** via diffusion modeling within each block’s continuous latent space.
 - **Flexible capacity allocation**, allowing principled trade-offs between speed and quality.
 
-
-<img src="images/model_overall.png" alt="High-level overview of the MADFormer architecture." width="600"/>
+<p align="center">
+  <img src="images/model_overall.png" alt="High-level overview of the MADFormer architecture." style="width:90%;"/>
+</p>
 
 The generation process of MADFormer: each image block is autoregressively predicted, then refined through a conditioned diffusion process.  
 
