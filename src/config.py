@@ -1,11 +1,11 @@
 import json
 from transformers.models.llama.configuration_llama import LlamaConfig
 from typing import List, Optional, Tuple, Union, Dict
+from pathlib import Path
 
 class MADFormerConfig(LlamaConfig):
     def __init__(self, 
                  vae_config_path: str = "",
-                 vae_path: str = "stabilityai/sd-vae-ft-mse",
                  unet_block_out_channels: List[int] = [512, 1024],
                  unet_num_layers_per_block: List[int] = [2, 2],
                  unet_resnet_groups: int = 8,
@@ -27,8 +27,7 @@ class MADFormerConfig(LlamaConfig):
             unet_time_emb_dim (int): Dim of time embedding passed into ResNet blocks.                    
         '''
         super().__init__(**kwargs)
-        self.vae_path = vae_path
-        self.vae_config = self.get_vae_config(vae_config_path)
+        self.vae_config = self.get_vae_config((Path(__file__).resolve().parent / "configs" / "model" / "vae.json").resolve())
         self.latent_patch_dim = self.vae_config["latent_channels"]
         self.unet_block_out_channels = unet_block_out_channels
         self.unet_num_layers_per_block = unet_num_layers_per_block

@@ -10,7 +10,7 @@ from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, AutoencoderKL
 from torchvision.utils import save_image
 from models import MADFormer
 
-def sample_on_single_gpu(model_ckpt, vae_path, sample_step, save_dir, args, cache_clean, range_start, range_end, max_bs):
+def sample_on_single_gpu(model_ckpt, vae_path, model_config_path, sample_step, save_dir, args, cache_clean, range_start, range_end, max_bs):
     """Runs inference on a single GPU, using batch processing."""
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -20,7 +20,7 @@ def sample_on_single_gpu(model_ckpt, vae_path, sample_step, save_dir, args, cach
         ar_len=args.ar_len,
         spatial_len=args.spatial_len,
         square_block=True,
-        model_config_path=args.model_config_path,
+        model_config_path=model_config_path if model_config_path else args.model_config_path,
         diff_depth=args.diff_depth,
         clear_cond=getattr(args, 'clear_cond', False),
         clear_clean=getattr(args, 'clear_clean', False),
@@ -71,7 +71,8 @@ def sample_on_single_gpu(model_ckpt, vae_path, sample_step, save_dir, args, cach
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str)
-    parser.add_argument("--sample_step", type=int, default=25)
+    parser.add_argument("--model_config_path", type=str, default=None)
+    parser.add_argument("--sample_step", type=int, default=250)
     parser.add_argument("--global_seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default='./')
     parser.add_argument("--cache_clean", action="store_true", default=False)
@@ -102,6 +103,7 @@ if __name__ == "__main__":
     sample_on_single_gpu(
         model_ckpt, 
         vae_path, 
+        args.model_config_path,
         args.sample_step, 
         args.save_dir, 
         args_model, 

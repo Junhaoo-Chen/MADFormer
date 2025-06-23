@@ -14,19 +14,12 @@ This repository contains the official implementation of **MADFormer**, a unified
 - **Local detail refinement** via diffusion modeling within each block’s continuous latent space.
 - **Flexible capacity allocation**, allowing principled trade-offs between speed and quality.
 
-> TODO: Add images for model arch
+
+<img src="images/model_overall.png" alt="High-level overview of the MADFormer architecture." width="600"/>
 
 The generation process of MADFormer: each image block is autoregressively predicted, then refined through a conditioned diffusion process.  
 
 MADFormer acts not only as a performant generator for high-resolution data like **FFHQ-1024** and regular images like **ImageNet-256**, but also as a **testbed** for exploring hybrid design choices. Notably, we show that **increasing AR layer allocation** can improve FID by up to **60–75%** under constrained inference budgets. Our modular design supports controlled experiments on inference cost, block granularity, loss objectives, and layer allocation—offering actionable insights for hybrid model design in multimodal generation.
-
-## Models
-We provide the model weights for MADFormer trained on FFHQ-1024 and ImageNet through the download links below.
-
-| Dataset          | 🤗 Link          |
-|:----------------:|:----------------:|
-| **FFHQ-1024** | [MADFormer-FFHQ](https://huggingface.co/JunhaoC/MADFormer-FFHQ/blob/main/ckpts.pt) |
-| **ImageNet**  | [MADFormer-ImageNet](https://huggingface.co/JunhaoC/MADFormer-ImageNet/blob/main/ckpts.pt) |
 
 ## Setup
 To set up the runtime environment for this project, install the required dependencies using the provided requirements.txt file:
@@ -35,17 +28,45 @@ pip install -r requirements.txt
 ```
 
 ## Training
-Our training configurations are provided in the `configs` directory, complete with model and training hyperparameters. You can use the following command to start training:
+
+To train MADFormer on FFHQ-1024, first download the dataset locally using Hugging Face `datasets`:
+
 ```bash
-cd src
-python train.py <training_args>
+python -c "from datasets import load_dataset; load_dataset('gaunernst/ffhq-1024-wds', num_proc=24).save_to_disk('./datasets/ffhq-1024')"
+```
+
+Our training configurations are provided in the `configs` directory, complete with model and training hyperparameters. You can use the following command to start training (arguments are set to reproduce FFHQ-1024 baseline results by default):
+
+```bash
+torchrun \
+    --rdzv_backend c10d \
+    --rdzv_id=456 \
+    --nproc-per-node=8 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --rdzv-endpoint=<rdvz_endpoint>  \
+    src/train.py --id=<experiment_id>
 ```
 
 ## Sampling
-After downloading the checkpoints or finishing pretraining, you can use the following scripts to generate images:
+
+We provide the pretrained model weights for MADFormer trained on FFHQ-1024. You can download the checkpoint using [this link](https://huggingface.co/JunhaoC/MADFormer-FFHQ/blob/main/ckpts.pt) or the CLI command below:
+
 ```bash
-cd src
-python sample.py --ckpt <path_to_checkpoint> --sample_steps <number_of_steps> --save_dir <output_directory> --range_start <id_of_first_image> --range_end <id_of_last_image> --max_bs <max_batch_size>
+mkdir -p ./ckpts/madformer_ffhq_baseline/
+
+huggingface-cli download JunhaoC/MADFormer-FFHQ \
+    --include ckpts.pt \
+    --local-dir ./ckpts/madformer_ffhq_baseline/ \
+    --local-dir-use-symlinks False
+```
+
+Once downloaded (or after training your own checkpoint), you can sample images with:
+
+```bash
+python src/sample.py \
+    --ckpt ./ckpts/madformer_ffhq_baseline/ckpts.pt \
+    --range_start 0 --range_end 7
 ```
 
 ## Evaluation

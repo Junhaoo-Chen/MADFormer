@@ -1,4 +1,5 @@
-/results
-/logs
+**/results/
+**/logs/
+**/datasets/
 
 **/__pycache__/
