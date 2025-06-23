@@ -8,11 +8,7 @@ This repository contains the official implementation of **MADFormer**, a unified
 
 ## Overview
 
-**MADFormer** (**M**ixed **A**utoregressive and **D**iffusion Transformer) bridges the strengths of autoregressive (AR) and diffusion-based generation through a unified architecture designed for **continuous image synthesis**. It introduces a **dual-axis hybridization strategy**, mixing AR and diffusion both across **image blocks** (token axis) and **transformer layers** (depth axis). This enables:
-
-- **Global context modeling** through autoregressive conditioning across image blocks.
-- **Local detail refinement** via diffusion modeling within each block’s continuous latent space.
-- **Flexible capacity allocation**, allowing principled trade-offs between speed and quality.
+**MADFormer** (**M**ixed **A**utoregressive and **D**iffusion Transformer) bridges the strengths of autoregressive (AR) and diffusion modeling in continuous image generation. It predicts M image patches at a time and uses the predicted patches as gold context for predicting the next patches. During each multi-patch prediction, it uses the first N transformer layers as AR layers for a one-pass prediction, and uses the rest layers as diffusion layers that are called recursively to refine the prediction. Users can choose how "AR" or "diffusion" the model is on two axes: the horizontal token axis (by adjusting M) and the vertical model layer axis (by adjusting N). One interesting finding from our paper is that models with a stronger AR presence performs better under constrained inference budget.
 
 <p align="center">
   <img src="images/model_overall.png" alt="High-level overview of the MADFormer architecture." style="width:90%;"/>
