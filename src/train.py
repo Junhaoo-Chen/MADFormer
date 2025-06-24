@@ -353,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_every", type=int, default=10000)
     parser.add_argument("--mixed_precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--image_size", type=int, choices=[256, 512, 1024], default=256)
+    parser.add_argument("--image_size", type=int, choices=[256, 512, 1024], default=1024)
     parser.add_argument("--patch_size", default=1, type=int, help="patch_size x patch_size of vae latents forms an input feature")
     parser.add_argument("--vae_latent_size", default=4, type=int, help="vae's latent feature size")
     parser.add_argument("--block_size", default=256, type=int, help="vae's latent feature size")
