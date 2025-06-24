@@ -26,13 +26,14 @@ pip install -r requirements.txt
 
 ## Training
 
-To train MADFormer on FFHQ-1024, first download the dataset locally using Hugging Face `datasets`:
+To train MADFormer on ImageNet-256, first download the dataset locally using Hugging Face `datasets`:
 
 ```bash
-python -c "from datasets import load_dataset; load_dataset('gaunernst/ffhq-1024-wds', num_proc=24).save_to_disk('./datasets/ffhq-1024')"
+export HF_TOKEN=<your_huggingface_token>
+python -c "from datasets import load_dataset; import os; SAVE_DIR='./dataset/imagenet'; os.makedirs(SAVE_DIR, exist_ok=True); ds=load_dataset('timm/imagenet-1k-wds', split='train', num_proc=24, token=os.getenv('HF_TOKEN')); ds.save_to_disk(SAVE_DIR)"
 ```
 
-Our training configurations are provided in the `configs` directory, complete with model and training hyperparameters. You can use the following command to start training (arguments are set to reproduce FFHQ-1024 baseline results by default):
+Our training configurations are provided in the `configs` directory, complete with model and training hyperparameters. You can use the following command to start training (arguments are set to reproduce ImageNet-256 baseline results by default):
 
 ```bash
 torchrun \
@@ -45,30 +46,21 @@ torchrun \
     src/train.py --id=<experiment_id>
 ```
 
+We have tested our training scripts on **ImageNet-256** dataset with 64 A100 GPUs.
+
 ## Sampling
 
-We provide the pretrained model weights for MADFormer trained on FFHQ-1024. You can download the checkpoint using [this link](https://huggingface.co/JunhaoC/MADFormer-FFHQ/blob/main/ckpts.pt) or the CLI command below:
-
-```bash
-mkdir -p ./ckpts/madformer_ffhq_baseline/
-
-huggingface-cli download JunhaoC/MADFormer-FFHQ \
-    --include ckpts.pt \
-    --local-dir ./ckpts/madformer_ffhq_baseline/ \
-    --local-dir-use-symlinks False
-```
-
-Once downloaded (or after training your own checkpoint), you can sample images with:
+After training your own checkpoint, you can sample images with:
 
 ```bash
 python src/sample.py \
-    --ckpt ./ckpts/madformer_ffhq_baseline/ckpts.pt \
-    --range_start 0 --range_end 7
+    --ckpt /Your/Checkpoint/Path/ckpts.pt \
+    --gen_num 8 --class_num 8 # Set class_num to gen_num to sample less than 1000 images
 ```
 
 ## Evaluation
 
-We adopt **Fréchet Inception Distance (FID)** as our primary evaluation metric for image quality. For **FFHQ-1024**, FID is computed over 8,000 generated samples. Image generation is performed with the **DDIM sampler** , using 250 sampling steps for FFHQ. To ensure stability, final FID scores are averaged across the last five checkpoints (saved every 10,000 steps). 
+We adopt **Fréchet Inception Distance (FID)** as our primary evaluation metric for image quality. For **ImageNet-256**, FID is computed over 50,000 generated samples. Image generation is performed with the **DDIM sampler** , using 100 sampling steps for ImageNet. To ensure stability, final FID scores are averaged across the last five checkpoints (saved every 10,000 steps). 
 
 FID scores are computed using the [pytorch-fid](https://pypi.org/project/pytorch-fid/) library.
 

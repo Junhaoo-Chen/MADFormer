@@ -253,7 +253,7 @@ class LlamaRMSNorm(nn.Module):
 
 
 #################################################################################
-#                              Core MADFormer Model                             #
+#                                 Core DiT Model                                #
 #################################################################################
 
 class SkipCausalAttention(nn.Module):
@@ -263,6 +263,7 @@ class SkipCausalAttention(nn.Module):
         num_heads=8,
         qkv_bias=True,
         rope=None,
+        text_rope=None,
         qk_norm=True,
         proj_bias=True,
         attn_drop=0.,
@@ -274,14 +275,15 @@ class SkipCausalAttention(nn.Module):
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.head_dim = dim // num_heads
         self.num_heads = num_heads
-        self.qkv_list = nn.ModuleList([nn.Linear(dim, dim * 3, bias=qkv_bias) for _ in range(2)])
-        self.q_norm_list = nn.ModuleList([norm_layer(self.head_dim) if qk_norm else nn.Identity() for _ in range(2)])
-        self.k_norm_list = nn.ModuleList([norm_layer(self.head_dim) if qk_norm else nn.Identity() for _ in range(2)])
-        self.proj_list = nn.ModuleList([nn.Linear(dim, dim, bias=proj_bias) for _ in range(2)])
+        self.qkv_list = nn.ModuleList([nn.Linear(dim, dim * 3, bias=qkv_bias) for _ in range(3)])
+        self.q_norm_list = nn.ModuleList([norm_layer(self.head_dim) if qk_norm else nn.Identity() for _ in range(3)])
+        self.k_norm_list = nn.ModuleList([norm_layer(self.head_dim) if qk_norm else nn.Identity() for _ in range(3)])
+        self.proj_list = nn.ModuleList([nn.Linear(dim, dim, bias=proj_bias) for _ in range(3)])
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
         self.caching, self.cached_k, self.cached_v = False, None, None
         self.rope = rope
+        self.text_rope = text_rope
         self.clear_clean = clear_clean
 
     def set_caching(self, flag):
@@ -294,22 +296,38 @@ class SkipCausalAttention(nn.Module):
             self.cached_v = self.cache_buffer_v
         
 
-    def forward(self, x, position_ids=None, attention_mask=None, block_size=None, cache=False, type_mask=None):
+    def forward(self, x, position_ids=None, text_position_ids=None, attention_mask=None, block_size=None, cache=False, type_mask=None):
         B, N, C = x.shape
         
-        clean_qkv = self.qkv_list[0](x[:, type_mask==0, :])
+        text_x = x[:, type_mask == 0, :]
+        clean_x = x[:, type_mask == 1, :]
+        noised_x = x[:, type_mask == 2, :]
+        
+        text_qkv = self.qkv_list[0](text_x)
+        text_qkv = text_qkv.reshape(B, text_qkv.size(1), 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        text_q, text_k, text_v = text_qkv.unbind(0)
+        text_q, text_k = self.q_norm_list[0](text_q), self.k_norm_list[0](text_k)
+        
+        clean_qkv = self.qkv_list[1](clean_x)
         clean_qkv = clean_qkv.reshape(B, clean_qkv.size(1), 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         clean_q, clean_k, clean_v = clean_qkv.unbind(0)
-        noised_qkv = self.qkv_list[1](x[:, type_mask==1, :])
+        clean_q, clean_k = self.q_norm_list[1](clean_q), self.k_norm_list[1](clean_k)
+        
+        noised_qkv = self.qkv_list[2](noised_x)
         noised_qkv = noised_qkv.reshape(B, noised_qkv.size(1), 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         noised_q, noised_k, noised_v = noised_qkv.unbind(0)
-        q = torch.cat((self.q_norm_list[0](clean_q), self.q_norm_list[1](noised_q)), dim=2)
-        k = torch.cat((self.k_norm_list[0](clean_k), self.k_norm_list[1](noised_k)), dim=2)
-        v = torch.cat((clean_v, noised_v), dim=2)
-        
-        if self.rope is not None:
-            q, k = self.rope(q, k, position_ids)
+        noised_q, noised_k = self.q_norm_list[2](noised_q), self.k_norm_list[2](noised_k)
 
+        img_q = torch.cat((clean_q, noised_q), dim=2)
+        img_k = torch.cat((clean_k, noised_k), dim=2)         
+        if self.rope is not None:
+            img_q, img_k = self.rope(img_q, img_k, position_ids)
+        text_q, text_k = self.text_rope(text_q, text_k, text_position_ids)
+        
+        q = torch.cat((text_q, img_q), dim=2)
+        k = torch.cat((text_k, img_k), dim=2)
+        v = torch.cat((text_v, clean_v, noised_v), dim=2)
+        
         if self.caching:
             if self.clear_clean:
                 if self.cached_k is not None:
@@ -321,9 +339,8 @@ class SkipCausalAttention(nn.Module):
             else:
                 if cache:
                     if self.cached_k is None:
-                        self.cached_k = k[:, :, :block_size, :]
-                        self.cached_v = v[:, :, :block_size, :]
-                        self.cached_x = x
+                        self.cached_k = k[:, :, :-block_size, :]
+                        self.cached_v = v[:, :, :-block_size, :]
                     else:
                         self.cached_k = torch.cat((self.cached_k, k[:, :, :block_size, :]), dim=2)
                         self.cached_v = torch.cat((self.cached_v, v[:, :, :block_size, :]), dim=2)
@@ -341,10 +358,46 @@ class SkipCausalAttention(nn.Module):
         else:
             x = flex_attention(q, k, v, block_mask=attention_mask)
         x = x.transpose(1, 2).reshape(B, N, C)
-        x = torch.cat((self.proj_list[0](x[:, type_mask==0, :]), self.proj_list[1](x[:, type_mask==1, :])), dim=1)
+        x = torch.cat((self.proj_list[0](x[:, type_mask==0, :]), self.proj_list[1](x[:, type_mask==1, :]), self.proj_list[2](x[:, type_mask==2, :])), dim=1)
         x = self.proj_drop(x)
         return x
-        
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def rotate_half(self, x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        orig_dtype = q.dtype
+        q = q.to(torch.float)
+        k = k.to(torch.float)
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+        return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
+    def forward(self, q, k, position_ids):
+        if position_ids is None or position_ids.shape[1] == 0:
+            return q, k
+        pos_ids = position_ids.float()
+        theta = pos_ids.unsqueeze(-1) * self.inv_freq  # shape: (batch, seq_len, dim/2)
+        cos = theta.cos()  # shape: (batch, seq_len, dim/2)
+        sin = theta.sin()  # shape: (batch, seq_len, dim/2)
+        cos = torch.cat([cos, cos], dim=-1)  # shape: (batch, seq_len, dim)
+        sin = torch.cat([sin, sin], dim=-1)  # shape: (batch, seq_len, dim)
+        q_embed, k_embed = self.apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        return q_embed, k_embed
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -379,19 +432,20 @@ class LlamaMLP(nn.Module):
         return down_proj
 
 class MADFormerDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx, rope=None, qk_norm=True, clear_clean=False, **block_kwargs):
+    def __init__(self, config, layer_idx, rope=None, text_rope=None, qk_norm=True, clear_clean=False, **block_kwargs):
         super().__init__()
-        self.self_attn = SkipCausalAttention(config.hidden_size, num_heads=config.num_attention_heads, qkv_bias=True, norm_layer=LlamaRMSNorm, qk_norm=qk_norm, rope=rope, clear_clean=clear_clean, **block_kwargs)
-        self.mlp_list = nn.ModuleList([LlamaMLP(config) for _ in range(2)])
-        self.input_layernorm_list = nn.ModuleList([LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(2)])
-        self.post_attention_layernorm_list = nn.ModuleList([LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(2)])
+        self.self_attn = SkipCausalAttention(config.hidden_size, num_heads=config.num_attention_heads, qkv_bias=True, norm_layer=LlamaRMSNorm, qk_norm=qk_norm, rope=rope, text_rope=text_rope, clear_clean=clear_clean, **block_kwargs)
+        self.mlp_list = nn.ModuleList([LlamaMLP(config) for _ in range(3)])
+        self.input_layernorm_list = nn.ModuleList([LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(3)])
+        self.post_attention_layernorm_list = nn.ModuleList([LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(3)])
 
-    def forward(self, hidden_states, block_size, cache=False, attention_mask=None, position_ids=None, type_mask=None, **kwargs):
+    def forward(self, hidden_states, block_size, cache=False, attention_mask=None, position_ids=None, text_position_ids=None, type_mask=None, **kwargs):
         residual = hidden_states
         
-        clean_states = hidden_states[:, type_mask==0, :]
-        noised_states = hidden_states[:, type_mask==1, :]
-        hidden_states = torch.cat((self.input_layernorm_list[0](clean_states), self.input_layernorm_list[1](noised_states)), dim=1)
+        text_states = hidden_states[:, type_mask==0, :]
+        clean_states = hidden_states[:, type_mask==1, :]
+        noised_states = hidden_states[:, type_mask==2, :]
+        hidden_states = torch.cat((self.input_layernorm_list[0](text_states), self.input_layernorm_list[1](clean_states), self.input_layernorm_list[2](noised_states)), dim=1)
 
         hidden_states = self.self_attn(
             hidden_states, 
@@ -399,14 +453,16 @@ class MADFormerDecoderLayer(nn.Module):
             block_size=block_size, 
             cache=cache, 
             position_ids=position_ids,
+            text_position_ids=text_position_ids,
             type_mask=type_mask
         )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        clean_states = self.post_attention_layernorm_list[0](hidden_states[:, type_mask==0, :])
-        noised_states = self.post_attention_layernorm_list[1](hidden_states[:, type_mask==1, :])
-        hidden_states = torch.cat((self.mlp_list[0](clean_states), self.mlp_list[1](noised_states)), dim=1)
+        text_states = self.post_attention_layernorm_list[0](hidden_states[:, type_mask==0, :])
+        clean_states = self.post_attention_layernorm_list[1](hidden_states[:, type_mask==1, :])
+        noised_states = self.post_attention_layernorm_list[2](hidden_states[:, type_mask==2, :])
+        hidden_states = torch.cat((self.mlp_list[0](text_states), self.mlp_list[1](clean_states), self.mlp_list[2](noised_states)), dim=1)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -417,22 +473,33 @@ class MADFormerDecoderLayer(nn.Module):
     def update_cache(self):
         self.self_attn.update_cache()
 
-def skip_causal_attn_mask_mod_gen(b, h, q_idx, kv_idx, block_size, len1):
-    q_idx = q_idx // block_size
-    kv_idx = kv_idx // block_size
-    mask = torch.where(((q_idx < len1) & (kv_idx < len1) & (q_idx >= kv_idx))| ((q_idx >= len1) & (kv_idx < len1) & ((q_idx - len1) > kv_idx)) | (q_idx == kv_idx) , True, False)
+def skip_causal_attn_mask_mod_gen(b, h, q_idx, kv_idx, block_size, len1, text_len):
+    mask = torch.where(
+        ((kv_idx < text_len) & (q_idx >= kv_idx)) |
+        ((q_idx >= text_len) & (kv_idx >= text_len) & (((q_idx - text_len) // block_size) < len1) & (((kv_idx - text_len) // block_size) < len1) & (((q_idx - text_len) // block_size) >= ((kv_idx - text_len) // block_size))) | 
+        ((q_idx >= text_len) & (kv_idx >= text_len) & (((q_idx - text_len) // block_size) >= len1) & (((kv_idx - text_len) // block_size) < len1) & ((((q_idx - text_len) // block_size) - len1) > ((kv_idx - text_len) // block_size))) | 
+        ((q_idx >= text_len) & (kv_idx >= text_len) & (((q_idx - text_len) // block_size) == ((kv_idx - text_len) // block_size))), 
+        True, 
+        False
+    )
     return mask
 
-def skip_causal_attn_mask_mod_gen_no_clean(b, h, q_idx, kv_idx, block_size, len1):
-    q_idx = q_idx // block_size
-    kv_idx = kv_idx // block_size
-    mask = torch.where(q_idx >= kv_idx , True, False)
+def skip_causal_attn_mask_mod_gen_no_clean(b, h, q_idx, kv_idx, block_size, len1, text_len):
+    mask = torch.where(
+        ((kv_idx < text_len) & (q_idx >= kv_idx)) |
+        ((q_idx >= text_len) & (kv_idx >= text_len) & (((q_idx - text_len) // block_size) >= ((kv_idx - text_len) // block_size))), 
+        True, 
+        False
+    )
     return mask
 
-def blockwise_self_attn_mask_mod_gen(b, h, q_idx, kv_idx, block_size, len1):
-    q_idx = q_idx // block_size
-    kv_idx = kv_idx // block_size
-    mask = torch.where(q_idx == kv_idx , True, False)
+def blockwise_self_attn_mask_mod_gen(b, h, q_idx, kv_idx, block_size, len1, text_len):
+    mask = torch.where(
+        ((kv_idx < text_len) & (q_idx >= kv_idx)) |
+        ((q_idx >= text_len) & (kv_idx >= text_len) & (((q_idx - text_len) // block_size) == ((kv_idx - text_len) // block_size))), 
+        True, 
+        False
+    )
     return mask
 
 class MADFormer(nn.Module):
@@ -445,7 +512,7 @@ class MADFormer(nn.Module):
         hidden_size=1152,
         depth=28,
         diff_depth=14,
-        num_heads=18,
+        num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         learn_sigma=False,
@@ -456,8 +523,7 @@ class MADFormer(nn.Module):
         model_config_path=None,
         clear_clean=False,
         clear_cond=False,
-        denoising_mlp=False,
-        cache_clean=False
+        denoising_mlp=False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -469,6 +535,7 @@ class MADFormer(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.depth = depth
         self.diff_depth = diff_depth
+        self.head_dim = hidden_size // num_heads
 
         self.latent_size = latent_size
         self.block_size = block_size
@@ -479,7 +546,6 @@ class MADFormer(nn.Module):
         self.clear_clean = clear_clean
         self.clear_cond = clear_cond
         self.denoising_mlp = denoising_mlp
-        self.cache_clean = cache_clean
         assert self.spatial_len == self.block_size * self.ar_len, f"Split block invalid: {self.spatial_len} != {self.block_size} * {self.ar_len}"
 
         self.model_config = MADFormerConfig(**json.load(open(model_config_path, "r")))
@@ -492,6 +558,13 @@ class MADFormer(nn.Module):
         
         h = w = math.isqrt(self.spatial_len) 
         self.rope = RopeND(nd=2, nd_split=[1, 1], max_lens=[h, w])
+        
+        self.max_len = self.model_config.max_position_embeddings
+        self.text_rope = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=self.max_len, base=self.model_config.rope_theta)
+        self.embed_tokens = nn.Embedding(self.model_config.vocab_size, hidden_size, self.model_config.pad_token_id)
+        self.text_position_ids = torch.arange(self.max_len).unsqueeze(0)
+        self.lm_head = nn.Linear(hidden_size, self.model_config.vocab_size, bias=False)
+        
         def create_index_tensor(max_lens):
             ranges = [torch.arange(m) for m in max_lens]
             grids = torch.meshgrid(*ranges, indexing='ij')
@@ -507,22 +580,22 @@ class MADFormer(nn.Module):
             position_idx = position_idx.view(-1)
             self.position_ids_precompute = self.position_ids_precompute[:, position_idx]
         self.blocks = nn.ModuleList([
-            MADFormerDecoderLayer(self.model_config, layer_idx=i, rope=self.rope, qk_norm=self.qk_norm, clear_clean=self.clear_clean) for i in range(self.depth)
+            MADFormerDecoderLayer(self.model_config, layer_idx=i, rope=self.rope, text_rope=self.text_rope, qk_norm=self.qk_norm, clear_clean=self.clear_clean) for i in range(self.depth)
         ])
         self.initialize_weights()
         self.init_flex_attn()
 
     def init_flex_attn(self):
         if USE_FLEX_ATTENTION:
-            blockwise_self_attn_mask_mod = partial(blockwise_self_attn_mask_mod_gen, block_size=self.block_size, len1=self.ar_len)
+            blockwise_self_attn_mask_mod = partial(blockwise_self_attn_mask_mod_gen, block_size=self.block_size, len1=self.ar_len, text_len=self.max_len)
             if self.clear_clean:
-                skip_causal_attn_mask_mod = partial(skip_causal_attn_mask_mod_gen_no_clean, block_size=self.block_size, len1=self.ar_len)
-                self.flex_attnmask = create_block_mask(skip_causal_attn_mask_mod, B=None, H=None, Q_LEN=self.ar_len*self.block_size, KV_LEN=self.ar_len*self.block_size)
-                self.flex_attnmask_mlp = create_block_mask(blockwise_self_attn_mask_mod, B=None, H=None, Q_LEN=self.ar_len*self.block_size, KV_LEN=self.ar_len*self.block_size)
+                skip_causal_attn_mask_mod = partial(skip_causal_attn_mask_mod_gen_no_clean, block_size=self.block_size, len1=self.ar_len, text_len=self.max_len)
+                self.flex_attnmask = create_block_mask(skip_causal_attn_mask_mod, B=None, H=None, Q_LEN=self.max_len+self.ar_len*self.block_size, KV_LEN=self.max_len+self.ar_len*self.block_size)
+                self.flex_attnmask_mlp = create_block_mask(blockwise_self_attn_mask_mod, B=None, H=None, Q_LEN=self.max_len+self.ar_len*self.block_size, KV_LEN=self.max_len+self.ar_len*self.block_size)
             else:
-                skip_causal_attn_mask_mod = partial(skip_causal_attn_mask_mod_gen, block_size=self.block_size, len1=self.ar_len)
-                self.flex_attnmask = create_block_mask(skip_causal_attn_mask_mod, B=None, H=None, Q_LEN=2*self.ar_len*self.block_size, KV_LEN=2*self.ar_len*self.block_size)
-                self.flex_attnmask_mlp = create_block_mask(blockwise_self_attn_mask_mod, B=None, H=None, Q_LEN=2*self.ar_len*self.block_size, KV_LEN=2*self.ar_len*self.block_size)
+                skip_causal_attn_mask_mod = partial(skip_causal_attn_mask_mod_gen, block_size=self.block_size, len1=self.ar_len, text_len=self.max_len)
+                self.flex_attnmask = create_block_mask(skip_causal_attn_mask_mod, B=None, H=None, Q_LEN=self.max_len+2*self.ar_len*self.block_size, KV_LEN=self.max_len+2*self.ar_len*self.block_size)
+                self.flex_attnmask_mlp = create_block_mask(blockwise_self_attn_mask_mod, B=None, H=None, Q_LEN=self.max_len+2*self.ar_len*self.block_size, KV_LEN=self.max_len+2*self.ar_len*self.block_size)
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -562,25 +635,27 @@ class MADFormer(nn.Module):
         attn_mask[size:, size:] = m_noise_noise
         return attn_mask.bool().to(device) if not self.clear_clean else m_clean_clean.bool().to(device)
 
-    def build_inference_attention_mask(self, block_id, B, device):
-        attention_mask = torch.ones(2 * B, B * (block_id + 1))
+    def build_inference_attention_mask(self, block_id, text_len, B, device):
+        attention_mask = torch.ones(2 * B, text_len + B * (block_id + 1))
         attention_mask[:B, -B:] = torch.zeros(B, B)
         attention_mask = attention_mask.bool().to(device)
         return attention_mask
 
-    def build_block_self_attn_inference_attention_mask(self, block_id, B, device):
+    def build_block_self_attn_inference_attention_mask(self, block_id, text_len, B, device):
         if self.clear_clean:
-            attention_mask = torch.zeros(B, B * (block_id + 1))
+            attention_mask = torch.zeros(B, text_len + B * (block_id + 1))
             attention_mask[:, -B:] = torch.ones(B, B)
         else:
-            attention_mask = torch.zeros(2 * B, B * (block_id + 1))
+            attention_mask = torch.zeros(2 * B, text_len + B * (block_id + 1))
             attention_mask[:B, -2*B:-B] = torch.ones(B, B)
             attention_mask[B:, -B:] = torch.ones(B, B)
         attention_mask = attention_mask.bool().to(device)
         return attention_mask
 
-    def forward(self, clean_x, noised_x, t):
-        N, T, B, _ = clean_x.size()
+    def forward(self, input_ids, clean_x, noised_x, t):
+        N, T, B, _ = clean_x.size()    
+        hidden_states_text = self.embed_tokens(input_ids)
+        text_position_ids = self.text_position_ids.to(clean_x.device).expand(N, -1)
         
         clean_x = einops.rearrange(clean_x, 'N T (H W) C -> (N T) C H W', H=int(math.isqrt(B)))
         noised_x = einops.rearrange(noised_x, 'N T (H W) C -> (N T) C H W', H=int(math.isqrt(B)))
@@ -593,14 +668,17 @@ class MADFormer(nn.Module):
         if self.clear_clean:
             position_ids = self.position_ids_precompute
             x = shifted_clean_x
-            type_mask = torch.ones_like(shifted_clean_x)[0, :, 0]
+            type_mask = torch.full_like(shifted_clean_x, 2)
         else:
-            position_ids=torch.cat([self.position_ids_precompute , self.position_ids_precompute], dim=-1) # for MADFormer clean and noise
+            position_ids=torch.cat([self.position_ids_precompute , self.position_ids_precompute], dim=-1) # for ACDiT clean and noise
             x = torch.cat((clean_x, shifted_clean_x), dim=1)
-            type_mask = torch.cat((torch.zeros_like(clean_x), torch.ones_like(shifted_clean_x)), dim=1)[0, :, 0]
+            type_mask = torch.cat((torch.ones_like(clean_x), torch.full_like(shifted_clean_x, 2)), dim=1)
+        
+        x = torch.cat((hidden_states_text, x), dim=1)
+        type_mask = torch.cat((torch.zeros_like(hidden_states_text), type_mask), dim=1)[0, :, 0]
         
         if not USE_FLEX_ATTENTION:
-            raise NotImplementedError("Normal attn mask for denoising_mlp=True not implemented!")
+            raise NotImplementedError("Normal attn mask for denoising_mlp=True and text not implemented!")
             attention_mask = self.build_attention_mask(T, B, x.device)
         else:
             attention_mask = self.flex_attnmask
@@ -609,28 +687,31 @@ class MADFormer(nn.Module):
         for i, block in enumerate(self.blocks):
             block_attn_mask = attention_mask if i < self.depth - self.diff_depth else attention_mask_mlp
             if i == self.depth - self.diff_depth:
-                condition = x[:, -noised_x.size(1):, :]
+                condition = x[:, type_mask==2, :]
                 if self.clear_cond:
-                    x[:, -noised_x.size(1):, :] = noised_x
+                    x[:, type_mask==2, :] = noised_x
                 else:
-                    x[:, -noised_x.size(1):, :] += noised_x
-            x = block(x, self.block_size, cache=False, attention_mask=block_attn_mask, position_ids=position_ids, type_mask=type_mask)
+                    x[:, type_mask==2, :] += noised_x
+            x = block(x, self.block_size, cache=False, attention_mask=block_attn_mask, 
+                      position_ids=position_ids, text_position_ids=text_position_ids, type_mask=type_mask)
             
-        # Whole upsampling, need to extract noise part
+        logits = self.lm_head(x[:, type_mask==0, :])
         if self.clear_clean:
             clean_tower_output = None
         else:
-            clean_tower_output = einops.rearrange(x[:, :-noised_x.shape[1], :], 'N (T H W) C -> (N T) C H W', T=T, H=int(math.isqrt(self.block_size)))
+            clean_tower_output = einops.rearrange(x[:, type_mask==1, :], 'N (T H W) C -> (N T) C H W', T=T, H=int(math.isqrt(self.block_size)))
             clean_tower_output = self.upsampler(clean_tower_output, t, clean_x_res)
         condition = einops.rearrange(condition, 'N (T H W) C -> (N T) C H W', T=T, H=int(math.isqrt(self.block_size)))
         condition = self.upsampler(condition, t, clean_x_res)
-        x = einops.rearrange(x[:, -noised_x.shape[1]:, :], 'N (T H W) C -> (N T) C H W', T=T, H=int(math.isqrt(self.block_size)))
+        x = einops.rearrange(x[:, type_mask==2, :], 'N (T H W) C -> (N T) C H W', T=T, H=int(math.isqrt(self.block_size)))
         x = self.upsampler(x, t, noised_x_res)
-        return x, condition, clean_tower_output
+        return x, condition, clean_tower_output, logits
 
     @torch.no_grad()
-    def sample(self, scheduler, num_inference_steps, target_shape, generator=None, dtype=torch.bfloat16):
+    def sample(self, input_ids, scheduler, num_inference_steps, target_shape, generator=None, dtype=torch.bfloat16):
         N, T, B, C = target_shape
+        hidden_states_text = self.embed_tokens(input_ids)
+        text_position_ids = self.text_position_ids.to(input_ids.device).expand(N, -1)
         scheduler.set_timesteps(num_inference_steps, device='cuda')
 
         clean_latents = []
@@ -648,40 +729,41 @@ class MADFormer(nn.Module):
 
             # 1. AR pass to generate condition
             # NOTE: Caching logic here critical for clear_clean=True
-            cache_flag = block_id < T-1 if self.clear_clean else block_id > 0
+            cache_flag = block_id < T-1 if self.clear_clean else True
             if block_id > 0:
                 clean_x = einops.rearrange(clean_latents[-1], 'N T (H W) C -> (N T) C H W', H=int(math.isqrt(B)))
                 clean_x, clean_x_res = self.downsampler(clean_x, t)
                 clean_x = einops.rearrange(clean_x, '(N T) C H W -> N (T H W) C', T=1)
                 if not self.clear_clean:
                     x = torch.cat((clean_x, clean_x), dim=1)
-                    attention_mask = self.build_inference_attention_mask(block_id, self.block_size, x.device)
-                    type_mask = torch.cat((torch.zeros_like(clean_x), torch.ones_like(clean_x)), dim=1)[0, :, 0]
+                    attention_mask = self.build_inference_attention_mask(block_id, self.max_len, self.block_size, x.device)
+                    type_mask = torch.cat((torch.ones_like(clean_x), torch.full_like(clean_x, 2)), dim=1)[0, :, 0]
                 else:
                     x = clean_x
                     attention_mask = None
-                    type_mask = torch.ones_like(clean_x)[0, :, 0]
+                    type_mask = torch.full_like(clean_x, 2)[0, :, 0]
             else:
-                x = self.boi_block.expand(N, -1, -1)
-                attention_mask = None
-                type_mask = torch.ones_like(self.boi_block)[0, :, 0]
-            for block in self.blocks[:-self.diff_depth]:
-                x = block(x, self.block_size, cache=cache_flag, attention_mask=attention_mask, position_ids=position_ids, type_mask=type_mask)
+                x = torch.cat((hidden_states_text, self.boi_block.expand(N, -1, -1)), dim=1)
+                attention_mask = torch.tril(torch.ones(x.size(1), x.size(1)))
+                attention_mask[-self.block_size:, -self.block_size:] = 1 
+                attention_mask = attention_mask.bool().to(x.device)
+                type_mask = torch.cat((torch.zeros_like(hidden_states_text),  torch.full_like(self.boi_block.expand(N, -1, -1), 2)), dim=1)[0, :, 0]
+            for i, block in enumerate(self.blocks[:-self.diff_depth]):
+                x = block(x, self.block_size, cache=cache_flag, attention_mask=attention_mask, position_ids=position_ids, text_position_ids=text_position_ids, type_mask=type_mask)
             
             condition = x
             if self.clear_cond:
-                condition[:, -self.block_size:, :] = 0     
+                condition[:, type_mask==2, :] = 0     
 
             # 2. Denoising passes
             noised_x = randn_tensor((N, 1, B, C), device='cuda', generator=generator, dtype=dtype)
             scheduler.set_timesteps(num_inference_steps, device='cuda')
             if self.denoising_mlp:
-                attention_mask = self.build_block_self_attn_inference_attention_mask(block_id, self.block_size, x.device) if block_id > 0 else None
+                attention_mask = self.build_block_self_attn_inference_attention_mask(block_id, self.max_len, self.block_size, x.device) if block_id > 0 else None
             for t in scheduler.timesteps:
                 # NOTE: Caching logic here flexible for clear_clean=True
-                cache_timestep = scheduler.timesteps[-1] if self.cache_clean else scheduler.timesteps[0]
                 cache_flag = (block_id < T-1) and (t == scheduler.timesteps[-1]) if self.clear_clean \
-                    else (block_id > 0) and (t == cache_timestep)
+                    else (t == scheduler.timesteps[0])
                 timesteps = torch.tensor([t] * noised_x.size(0), device='cuda')
                 
                 noised_x = scheduler.scale_model_input(noised_x, t)
@@ -690,11 +772,11 @@ class MADFormer(nn.Module):
                 noised_x_downsampled_square = einops.rearrange(noised_x_downsampled, '(N T) C H W -> N (T H W) C', T=1)
                 
                 x = condition.clone()
-                x[:, -noised_x_downsampled_square.size(1):, :] += noised_x_downsampled_square
-                for block in self.blocks[-self.diff_depth:]:
-                    x = block(x, self.block_size, cache=cache_flag, attention_mask=attention_mask, position_ids=position_ids, type_mask=type_mask)
+                x[:, type_mask==2, :] += noised_x_downsampled_square
+                for i, block in enumerate(self.blocks[-self.diff_depth:]):
+                    x = block(x, self.block_size, cache=cache_flag, attention_mask=attention_mask, position_ids=position_ids, text_position_ids=text_position_ids, type_mask=type_mask)
 
-                x = einops.rearrange(x[:, -self.block_size:, :], 'N (H W) C -> N C H W', H=int(math.isqrt(self.block_size)))
+                x = einops.rearrange(x[:, type_mask==2, :], 'N (H W) C -> N C H W', H=int(math.isqrt(self.block_size)))
                 noise_pred = self.upsampler(x, timesteps, noised_x_res)
                 noise_pred = einops.rearrange(noise_pred, 'N C H W -> N (H W) C').unsqueeze(1)
                 noised_x = scheduler.step(noise_pred, t, noised_x).prev_sample
@@ -702,6 +784,7 @@ class MADFormer(nn.Module):
             for block in self.blocks:
                 block.update_cache()
             clean_latents.append(noised_x)
+            text_position_ids = None
             
         clean_latents = torch.cat(clean_latents, dim=1)
         for block in self.blocks:
